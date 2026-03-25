@@ -365,4 +365,72 @@
     (var-get dispute-window-blocks)
 )
 
+;; =========================================================================
+;; The final code snippet: Claim Rewards for a resolved market (40+ lines)
+;; =========================================================================
+;; This function allows users to claim their winnings after a market is resolved.
+;; It performs several crucial security checks:
+;; 1. Ensures the market exists, is resolved, and NOT canceled.
+;; 2. Ensures the dispute window has passed and no active disputes exist.
+;; 3. Ensures the user hasn't already claimed their reward (preventing double-spend).
+;; 4. Calculates the proportional reward based on the winning pool size minus fees.
+;; 5. Updates the user's claimed status BEFORE transferring funds (Checks-Effects-Interactions pattern).
+(define-public (claim-rewards (market-id uint))
+    (let
+        (
+            (market (unwrap! (map-get? markets { market-id: market-id }) err-market-not-found))
+            (user-bet (unwrap! (map-get? bets { market-id: market-id, user: tx-sender }) err-no-bets))
+            (is-resolved (get resolved market))
+            (is-canceled (get is-canceled market))
+            (is-disputed (get is-disputed market))
+            (winning-outcome (unwrap! (get outcome market) err-market-unresolved))
+            (has-claimed (get claimed user-bet))
+            (yes-pool (get total-yes-pool market))
+            (no-pool (get total-no-pool market))
+            (blocks-passed (- block-height (get resolution-height market)))
+        )
+        (try! (check-not-paused))
+        
+        ;; Security: Market must be resolved and not canceled
+        (asserts! is-resolved err-market-unresolved)
+        (asserts! (not is-canceled) err-market-canceled)
+        
+        ;; Security: Dispute window must have passed, and no active disputes
+        (asserts! (not is-disputed) err-dispute-active)
+        (asserts! (>= blocks-passed (var-get dispute-window-blocks)) err-dispute-active)
+        
+        ;; Security: Prevent double claiming
+        (asserts! (not has-claimed) err-already-claimed)
+        
+        (let
+            (
+                (reward-amount
+                    (if winning-outcome
+                        ;; YES won
+                        (if (> (get yes-amount user-bet) u0)
+                            (calculate-reward (get yes-amount user-bet) yes-pool no-pool)
+                            u0)
+                        ;; NO won
+                        (if (> (get no-amount user-bet) u0)
+                            (calculate-reward (get no-amount user-bet) no-pool yes-pool)
+                            u0)
+                    )
+                )
+            )
+            ;; Security: Only process if there is a reward to claim
+            (asserts! (> reward-amount u0) err-invalid-amount)
+            
+            ;; Effect: Mark as claimed BEFORE transferring to prevent re-entrancy
+            (map-set bets
+                { market-id: market-id, user: tx-sender }
+                (merge user-bet { claimed: true })
+            )
+            
+            ;; Interaction: Transfer the calculated reward from contract to user
+            (print { event: "claim-rewards", market-id: market-id, user: tx-sender, reward: reward-amount })
+            (as-contract (stx-transfer? reward-amount tx-sender tx-sender))
+        )
+    )
+)
+
 
